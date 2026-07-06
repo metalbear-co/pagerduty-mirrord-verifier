@@ -1,0 +1,23 @@
+{
+  "name": "scenario-1-fix-works",
+  "description": "Realistic p99 alert. Let Claude propose a fix. Verifier should PASS the timeout patch.",
+  "repo_path": "sample-app",
+  "use_claude": true,
+  "alert": {
+    "event_id": "dd-evt-9c1f8a",
+    "alert_title": "[p99 high] checkout latency above SLO",
+    "title": "[p99 high] checkout latency above SLO",
+    "event_msg": "Monitor 'checkout.p99.latency' triggered. p99 over the last 10 minutes is 1,420ms; SLO is 300ms. Error rate is 0% — requests are completing but slow. Downstream pricing service is the suspected bottleneck.",
+    "body": "Monitor 'checkout.p99.latency' triggered. p99 over the last 10 minutes is 1,420ms; SLO is 300ms. Error rate is 0% — requests are completing but slow. Downstream pricing service is the suspected bottleneck.",
+    "service": "checkout",
+    "metric": "checkout.http.request.duration.p99",
+    "alert_threshold": 300,
+    "last_value": 1420,
+    "alert_transition": "error",
+    "tags": {
+      "service": "checkout",
+      "env": "staging",
+      "team": "payments"
+    }
+  }
+}

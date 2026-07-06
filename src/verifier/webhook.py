@@ -1,0 +1,247 @@
+"""FastAPI webhook receiver. Accepts Datadog alert payloads, kicks off verification."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+# uvicorn doesn't configure the root logger, so our module loggers go nowhere
+# by default. Wire them to stdout at INFO so engine/preview diagnostics show
+# up in `kubectl logs`.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+
+from .engine import VerificationEngine
+from .models import Alert, PreviewArtifact, Severity, VerificationResult
+from .poster import StdoutPoster
+
+log = logging.getLogger("verifier.webhook")
+
+app = FastAPI(title="mirrord-sre-verifier", version="0.1.0")
+
+# INTEGRATION: in production these are constructed per-tenant from config.
+# Lazy so importing this module doesn't require ANTHROPIC_API_KEY.
+_orchestrator = None
+_engine: VerificationEngine | None = None
+_poster: StdoutPoster | None = None
+
+
+def _get_orchestrator():
+    global _orchestrator
+    if _orchestrator is None:
+        from .orchestrator import AISREOrchestrator
+
+        _orchestrator = AISREOrchestrator()
+    return _orchestrator
+
+
+def _get_engine() -> VerificationEngine:
+    global _engine
+    if _engine is None:
+        _engine = VerificationEngine()
+    return _engine
+
+
+def _get_poster() -> StdoutPoster:
+    global _poster
+    if _poster is None:
+        _poster = StdoutPoster()
+    return _poster
+
+
+def parse_datadog_payload(payload: dict[str, Any]) -> Alert:
+    """Map a Datadog webhook body into our Alert shape.
+
+    Datadog's payload schema is configurable per-monitor; this maps the default
+    @webhook-* template fields documented at
+    https://docs.datadoghq.com/integrations/webhooks/. INTEGRATION: tighten to
+    whatever template the production monitors use.
+    """
+    try:
+        return Alert(
+            id=str(payload.get("id") or payload.get("alert_id") or payload["event_id"]),
+            title=payload.get("title") or payload["alert_title"],
+            body=payload.get("body") or payload.get("event_msg", ""),
+            severity=Severity(payload.get("alert_transition", "error").lower())
+            if payload.get("alert_transition", "").lower() in {s.value for s in Severity}
+            else Severity.ERROR,
+            service=payload.get("service") or payload.get("tags", {}).get("service", "unknown"),
+            metric=payload.get("metric"),
+            threshold=payload.get("alert_threshold"),
+            observed=payload.get("last_value"),
+            tags=payload.get("tags", {}) if isinstance(payload.get("tags"), dict) else {},
+            fired_at=datetime.utcnow(),
+            repo_path=Path(payload["repo_path"]) if payload.get("repo_path") else None,
+            raw=payload,
+        )
+    except (KeyError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"Unparseable alert: {e}") from e
+
+
+def parse_alertmanager_payload(payload: dict[str, Any]) -> list[Alert]:
+    """Map an Alertmanager v4 webhook body into Alerts.
+
+    AM bundles multiple alerts in one POST. We return one Alert per firing
+    item. The verifier only acts on `status=firing` — resolved alerts skip the
+    pipeline. AM webhook schema:
+    https://prometheus.io/docs/alerting/latest/configuration/#webhook_config
+
+    The repo location and mirrord target are read from the rule's annotations:
+      repo_path, verifier_target, verifier_namespace
+    """
+    if payload.get("version") not in (None, "4"):
+        raise HTTPException(status_code=400, detail=f"unsupported AM version {payload.get('version')}")
+
+    out: list[Alert] = []
+    for item in payload.get("alerts", []):
+        if item.get("status") != "firing":
+            continue
+        labels = item.get("labels") or {}
+        annotations = item.get("annotations") or {}
+        try:
+            fired_at = datetime.fromisoformat(item["startsAt"].replace("Z", "+00:00")).replace(tzinfo=None)
+        except (KeyError, ValueError):
+            fired_at = datetime.utcnow()
+
+        out.append(Alert(
+            id=item.get("fingerprint") or f"{labels.get('alertname')}:{labels.get('service')}",
+            title=annotations.get("summary") or labels.get("alertname", "alert"),
+            body=annotations.get("description", ""),
+            severity=Severity(labels["severity"].lower())
+            if labels.get("severity", "").lower() in {s.value for s in Severity}
+            else Severity.ERROR,
+            service=labels.get("service", "unknown"),
+            metric=labels.get("alertname"),
+            tags=labels,
+            fired_at=fired_at,
+            source="alertmanager",
+            repo_path=Path(annotations["repo_path"]) if annotations.get("repo_path") else None,
+            target=annotations.get("verifier_target"),
+            namespace=annotations.get("verifier_namespace"),
+            raw=item,
+        ))
+    return out
+
+
+@app.post("/webhook/datadog")
+async def datadog_webhook(payload: dict[str, Any], bg: BackgroundTasks) -> dict[str, str]:
+    alert = parse_datadog_payload(payload)
+    log.info("alert received src=datadog id=%s service=%s", alert.id, alert.service)
+    bg.add_task(_run_pipeline, alert)
+    return {"status": "accepted", "alert_id": alert.id}
+
+
+@app.post("/webhook/alertmanager")
+async def alertmanager_webhook(payload: dict[str, Any], bg: BackgroundTasks) -> dict[str, Any]:
+    alerts = parse_alertmanager_payload(payload)
+    log.info("alertmanager batch: %d firing alerts", len(alerts))
+    accepted = []
+    for alert in alerts:
+        bg.add_task(_run_pipeline, alert)
+        accepted.append(alert.id)
+    return {"status": "accepted", "alert_ids": accepted}
+
+
+@app.get("/healthz")
+async def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/debug")
+async def debug() -> dict[str, Any]:
+    """Quick pod introspection. Useful when `kubectl exec` is restricted."""
+    import shutil as _sh
+    import subprocess as _sp
+    import sys as _sys
+
+    def _safe_run(argv: list[str]) -> dict[str, Any]:
+        try:
+            p = _sp.run(argv, capture_output=True, text=True, timeout=15)
+            return {"exit": p.returncode, "stdout": p.stdout[-2000:], "stderr": p.stderr[-2000:]}
+        except Exception as e:
+            return {"error": repr(e)}
+
+    return {
+        "python": _sys.executable,
+        "mirrord_path": _sh.which("mirrord"),
+        "mirrord_version": _safe_run(["mirrord", "--version"]),
+        "scaffold_sample_ls": _safe_run(["ls", "-la", "/scaffold/sample-app/app"]),
+        "env_relevant": {
+            k: v for k, v in os.environ.items()
+            if k in {"PATH", "PYTHONPATH", "PRICING_URL", "VERIFIER_MODEL",
+                     "MIRRORD_TARGET", "MIRRORD_NAMESPACE", "VERIFIER_SAMPLE_REPO"}
+        },
+    }
+
+
+async def _run_pipeline(alert: Alert) -> None:
+    """Two-stage flow: exec-verify (always) → preview env (only on PASS)."""
+    try:
+        patch = await asyncio.to_thread(_get_orchestrator().propose_patch, alert)
+        bundle = await asyncio.to_thread(_get_engine().verify, alert, patch)
+
+        if bundle.result == VerificationResult.PASS:
+            try:
+                bundle.preview = await asyncio.to_thread(_build_preview, alert, patch)
+            except Exception:
+                # Don't fail the pipeline on stage-2 errors — the stage-1 verdict
+                # is still useful, and preview is the human-facing nice-to-have.
+                log.exception("stage 2 (preview env) failed; posting stage-1 only")
+
+        await asyncio.to_thread(_get_poster().post, bundle)
+    except Exception:
+        log.exception("pipeline failed for alert %s", alert.id)
+
+
+def _build_preview(alert: Alert, patch) -> PreviewArtifact:
+    """Stage 2: re-apply the patch to a fresh dir, build image, start preview.
+
+    Re-applying (vs. reusing the temp dir from stage 1) keeps the engine
+    cleanly scoped to verification — stage 2 doesn't need to coordinate
+    with stage 1's tempfile lifecycle.
+    """
+    import shutil
+    import tempfile
+    import time as _t
+    from pathlib import Path as _Path
+
+    from .engine import VerificationEngine as _Engine
+    from .preview import PreviewBuilder
+
+    if alert.target is None or alert.namespace is None:
+        raise RuntimeError("alert must carry target+namespace for stage 2 preview")
+
+    builder = PreviewBuilder()
+    session_id = f"verify-{alert.id[:12].replace(':', '-')}-{int(_t.time())}".lower()
+
+    with tempfile.TemporaryDirectory(prefix="verifier-stage2-") as tmp:
+        patched_dir = _Path(tmp) / "patched"
+        shutil.copytree(alert.repo_path, patched_dir)
+        # Reuse the engine's patch application logic. Static method would be
+        # cleaner; for now we instantiate.
+        _Engine()._apply_patch(patched_dir, patch)
+        info = builder.build_and_start(
+            patched_dir=patched_dir,
+            session_id=session_id,
+            target=alert.target,
+            namespace=alert.namespace,
+        )
+
+    return PreviewArtifact(
+        env_key=info.env_key,
+        image=info.image,
+        target=info.target,
+        namespace=info.namespace,
+        ttl_minutes=info.ttl_minutes,
+        service_hostname=info.service_hostname,
+        curl_recipe=info.curl_recipe(),
+    )

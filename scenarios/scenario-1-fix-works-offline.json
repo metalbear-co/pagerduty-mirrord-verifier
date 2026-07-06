@@ -1,0 +1,37 @@
+{
+  "name": "scenario-1-fix-works-offline",
+  "description": "Offline twin of scenario-1: uses a hand-crafted GOOD patch (timeout_ms=200) so the demo's PASS case runs without ANTHROPIC_API_KEY. Useful for CI and for offline kickoff demos. The non-offline scenario-1 lets Claude propose the patch.",
+  "repo_path": "sample-app",
+  "use_claude": false,
+  "alert": {
+    "event_id": "dd-evt-9c1f8a",
+    "alert_title": "[p99 high] checkout latency above SLO",
+    "title": "[p99 high] checkout latency above SLO",
+    "event_msg": "Monitor 'checkout.p99.latency' triggered. p99 is 1,420ms; SLO is 300ms.",
+    "body": "Monitor 'checkout.p99.latency' triggered. p99 is 1,420ms; SLO is 300ms.",
+    "service": "checkout",
+    "metric": "checkout.http.request.duration.p99",
+    "alert_threshold": 300,
+    "last_value": 1420,
+    "alert_transition": "error",
+    "tags": {"service": "checkout", "env": "staging", "team": "payments"}
+  },
+  "prepared_patch": {
+    "summary": "Wrap fetch_price in a 200ms timeout. The client already supports the kwarg.",
+    "hypothesis": "The pricing service has a long latency tail. Without a timeout, checkout p99 inherits it.",
+    "repro_steps": [
+      "Drive 100 checkout requests",
+      "Observe p99 latency before and after the patch"
+    ],
+    "files": [
+      {
+        "path": "app/checkout.py",
+        "before": "\"\"\"Checkout endpoint.\n\nPLANTED BUG: `fetch_price` is called with no timeout. When the pricing service\nhas tail latency (which it does — that is the live cluster state), checkout p99\nexplodes. The AI-SRE should propose wrapping the call in a timeout. The\nverifier then proves the patch actually fixes p99 by running both versions\nunder mirrord against the same pricing service.\n\"\"\"\n\nfrom __future__ import annotations\n\nfrom .pricing import fetch_price\n\n\ndef checkout(item_id: str, qty: int) -> dict:\n    # BUG: no timeout on the downstream pricing call.\n    price = fetch_price(item_id)\n    return {\"item_id\": item_id, \"qty\": qty, \"total\": price * qty}",
+        "after": "\"\"\"Checkout endpoint (with fix: bounded downstream latency).\"\"\"\n\nfrom __future__ import annotations\n\nfrom .pricing import PricingError, fetch_price\n\n\ndef checkout(item_id: str, qty: int) -> dict:\n    try:\n        price = fetch_price(item_id, timeout_ms=200)\n    except PricingError:\n        price = 0.0\n    return {\"item_id\": item_id, \"qty\": qty, \"total\": price * qty}"
+      }
+    ],
+    "confidence": 0.92,
+    "expected_signal_change": "p99 drops below 300ms",
+    "model": "scenario-prepared"
+  }
+}

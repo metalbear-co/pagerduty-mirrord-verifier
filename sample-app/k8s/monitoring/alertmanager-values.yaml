@@ -1,0 +1,31 @@
+# Apply with:
+#   helm upgrade monitoring prometheus-community/kube-prometheus-stack \
+#     --namespace monitoring --reuse-values \
+#     --values sample-app/k8s/monitoring/alertmanager-values.yaml
+#
+# Routes ALL alerts to the verifier's /webhook/alertmanager endpoint. For a
+# multi-tenant setup you'd route by labels (service, team, etc.).
+
+alertmanager:
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: 'null'
+      group_by: ['alertname', 'service']
+      group_wait: 10s
+      group_interval: 30s
+      repeat_interval: 30m
+      # Only verifier-eligible alerts go to the verifier. Convention: the
+      # PrometheusRule sets `route: verifier` as a label on alerts that opt in.
+      # Everything else (infra alerts, watchdog, etc.) drops to the null sink.
+      routes:
+        - receiver: 'verifier-webhook'
+          matchers:
+            - route = "verifier"
+    receivers:
+      - name: 'null'
+      - name: 'verifier-webhook'
+        webhook_configs:
+          - url: 'http://verifier.verifier-poc.svc.cluster.local:8000/webhook/alertmanager'
+            send_resolved: false

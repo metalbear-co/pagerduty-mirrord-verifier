@@ -1,0 +1,45 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: checkout-slo
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: checkout
+      interval: 15s
+      rules:
+        - alert: CheckoutP99High
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum(rate(checkout_request_duration_seconds_bucket[2m])) by (le)
+            ) > 0.3
+          for: 30s
+          labels:
+            severity: critical
+            service: checkout
+            route: verifier
+          annotations:
+            summary: "checkout p99 latency above SLO"
+            description: "p99 over last 2m is {{ $value }}s, SLO is 0.3s"
+            repo_path: "/scaffold/sample-app"
+            verifier_target: "deploy/checkout"
+            verifier_namespace: "verifier-poc"
+
+        - alert: CheckoutErrorRateHigh
+          expr: |
+            sum(rate(checkout_request_errors_total[2m]))
+              /
+            sum(rate(checkout_requests_total[2m])) > 0.05
+          for: 30s
+          labels:
+            severity: critical
+            service: checkout
+            route: verifier
+          annotations:
+            summary: "checkout 5xx rate above SLO"
+            description: "error rate over last 2m is {{ $value | humanizePercentage }}, SLO is 5%"
+            repo_path: "/scaffold/sample-app"
+            verifier_target: "deploy/checkout"
+            verifier_namespace: "verifier-poc"
