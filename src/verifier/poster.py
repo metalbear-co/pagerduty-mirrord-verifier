@@ -18,67 +18,54 @@ class Poster(Protocol):
 
 
 class StdoutPoster:
-    """Prints the bundle to stdout. Default for the demo."""
+    """Prints the bundle to stdout. Default fallback when no PAGERDUTY_REST_API_KEY is set."""
 
     def post(self, bundle: ProofBundle) -> None:
         print(bundle.as_markdown())
 
 
-class DatadogEventPoster:
-    """Posts the bundle as a Datadog event tagged to the original alert.
+class PagerDutyIncidentNotePoster:
+    """Posts the proof bundle as a note on the originating PagerDuty incident.
 
-    Datadog API ref: https://docs.datadoghq.com/api/latest/events/#post-an-event
+    PD REST API: POST /incidents/{id}/notes
+      Auth:     Authorization: Token token=<REST API key>
+      From:     required email header (any user in the account)
+      Accept:   application/vnd.pagerduty+json;version=2
+      Body:     {"note": {"content": "..."}}
+
+    The incident id is expected on bundle.alert.raw["event"]["data"]["id"],
+    which is where the PagerDuty V3 webhook parser writes it.
     """
 
-    def __init__(self, api_key: str | None = None, site: str = "datadoghq.com") -> None:
-        self.api_key = api_key or os.environ.get("DATADOG_API_KEY")
+    BASE = "https://api.pagerduty.com/incidents"
+
+    def __init__(self, api_key: str | None = None, from_email: str | None = None) -> None:
+        self.api_key = api_key or os.environ.get("PAGERDUTY_REST_API_KEY")
         if not self.api_key:
-            raise RuntimeError("DATADOG_API_KEY required for DatadogEventPoster")
-        self.base = f"https://api.{site}/api/v1/events"
+            raise RuntimeError("PAGERDUTY_REST_API_KEY required for PagerDutyIncidentNotePoster")
+        self.from_email = from_email or os.environ.get("PAGERDUTY_FROM_EMAIL", "verifier@metalbear.com")
 
     def post(self, bundle: ProofBundle) -> None:
-        payload = {
-            "title": f"mirrord verification: {bundle.result.value} — {bundle.alert.title}",
-            "text": bundle.as_markdown(),
-            "tags": [
-                f"alert_id:{bundle.alert.id}",
-                f"verifier:mirrord",
-                f"result:{bundle.result.value}",
-                f"service:{bundle.alert.service}",
-            ],
-            "alert_type": "info" if bundle.result.value == "pass" else "warning",
-            "source_type_name": "mirrord-sre-verifier",
-        }
-        r = httpx.post(self.base, headers={"DD-API-KEY": self.api_key}, json=payload, timeout=10)
-        r.raise_for_status()
-        log.info("posted verification to Datadog: status=%s", r.status_code)
-
-
-class GitHubPRCommentPoster:
-    """Posts the bundle as a comment on a GitHub PR.
-
-    INTEGRATION: in production the alert payload (or the AI-SRE's output)
-    carries the PR number to comment on. The scaffold leaves PR routing as a
-    TODO because it depends on the partner vendor's workflow.
-    """
-
-    def __init__(self, repo: str, pr_number: int, token: str | None = None) -> None:
-        self.repo = repo
-        self.pr_number = pr_number
-        self.token = token or os.environ.get("GITHUB_TOKEN")
-        if not self.token:
-            raise RuntimeError("GITHUB_TOKEN required for GitHubPRCommentPoster")
-
-    def post(self, bundle: ProofBundle) -> None:
-        url = f"https://api.github.com/repos/{self.repo}/issues/{self.pr_number}/comments"
+        incident_id = _extract_incident_id(bundle)
+        if not incident_id:
+            raise RuntimeError("no PagerDuty incident id on the alert; cannot post note")
+        url = f"{self.BASE}/{incident_id}/notes"
         r = httpx.post(
             url,
             headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/vnd.github+json",
+                "Authorization": f"Token token={self.api_key}",
+                "From": self.from_email,
+                "Accept": "application/vnd.pagerduty+json;version=2",
+                "Content-Type": "application/json",
             },
-            json={"body": bundle.as_markdown()},
-            timeout=10,
+            json={"note": {"content": bundle.as_markdown()}},
+            timeout=15,
         )
         r.raise_for_status()
-        log.info("posted verification to %s#%s", self.repo, self.pr_number)
+        log.info("posted verification to PagerDuty incident %s", incident_id)
+
+
+def _extract_incident_id(bundle: ProofBundle) -> str | None:
+    raw = bundle.alert.raw or {}
+    # PagerDuty V3 webhook: raw["event"]["data"]["id"]
+    return (raw.get("event") or {}).get("data", {}).get("id") or raw.get("incident_id")

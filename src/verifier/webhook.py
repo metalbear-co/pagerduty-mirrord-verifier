@@ -1,8 +1,10 @@
-"""FastAPI webhook receiver. Accepts Datadog alert payloads, kicks off verification."""
+"""FastAPI webhook receiver. Accepts PagerDuty V3 webhook payloads, kicks off verification."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
 from datetime import datetime
@@ -18,11 +20,11 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 from .engine import VerificationEngine
 from .models import Alert, PreviewArtifact, Severity, VerificationResult
-from .poster import StdoutPoster
+from .poster import PagerDutyIncidentNotePoster, Poster, StdoutPoster
 
 log = logging.getLogger("verifier.webhook")
 
@@ -51,11 +53,81 @@ def _get_engine() -> VerificationEngine:
     return _engine
 
 
-def _get_poster() -> StdoutPoster:
+def _get_poster() -> Poster:
     global _poster
     if _poster is None:
-        _poster = StdoutPoster()
+        if os.environ.get("PAGERDUTY_REST_API_KEY"):
+            _poster = PagerDutyIncidentNotePoster()
+            log.info("poster: PagerDutyIncidentNotePoster")
+        else:
+            _poster = StdoutPoster()
+            log.info("poster: StdoutPoster (PAGERDUTY_REST_API_KEY unset)")
     return _poster
+
+
+def _verify_pagerduty_signature(raw_body: bytes, header: str | None) -> None:
+    """PagerDuty V3 webhook signature check.
+
+    Header shape: `v1=<hex>[,v1=<hex>...]` (multiple during rotation).
+    Body must be verified byte-for-byte, so this runs BEFORE FastAPI json-parses.
+    """
+    secret = os.environ.get("PAGERDUTY_WEBHOOK_SIGNING_SECRET")
+    if not secret:
+        log.warning("PAGERDUTY_WEBHOOK_SIGNING_SECRET unset; skipping signature check")
+        return
+    if not header:
+        raise HTTPException(status_code=401, detail="missing x-pagerduty-signature")
+
+    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    presented = [p.split("=", 1)[1] for p in header.split(",") if p.startswith("v1=")]
+    if not any(hmac.compare_digest(expected, p) for p in presented):
+        raise HTTPException(status_code=401, detail="signature mismatch")
+
+
+def parse_pagerduty_v3_payload(payload: dict[str, Any]) -> Alert | None:
+    """Map a PagerDuty V3 webhook body into our Alert shape.
+
+    PD V3 webhook envelope:
+      { "event": { "event_type": "incident.triggered" | "incident.annotated",
+                   "data": { "id": "P123ABC", "title": "...", "service": {...} } } }
+
+    Returns None for events we don't act on (e.g. annotations we posted ourselves).
+    """
+    event = payload.get("event") or {}
+    et = event.get("event_type", "")
+    if et not in {"incident.triggered", "incident.annotated"}:
+        return None
+
+    data = event.get("data") or {}
+    incident_id = data.get("id")
+    if not incident_id:
+        raise HTTPException(status_code=400, detail="missing event.data.id")
+
+    # Skip annotations that carry our own signature to avoid feedback loops.
+    if et == "incident.annotated":
+        content = (data.get("content") or "").lower()
+        if "mirrord verification" in content:
+            log.info("skipping self-annotation on incident %s", incident_id)
+            return None
+
+    service = (data.get("service") or {}).get("summary", "unknown")
+    try:
+        fired_at = datetime.fromisoformat(
+            (data.get("created_at") or event.get("occurred_at", "")).replace("Z", "+00:00")
+        ).replace(tzinfo=None)
+    except ValueError:
+        fired_at = datetime.utcnow()
+
+    return Alert(
+        id=incident_id,
+        title=data.get("title") or f"PagerDuty incident {incident_id}",
+        body=data.get("description") or data.get("title", ""),
+        severity=Severity.ERROR,
+        service=service,
+        fired_at=fired_at,
+        source="pagerduty",
+        raw=payload,
+    )
 
 
 def parse_datadog_payload(payload: dict[str, Any]) -> Alert:
@@ -130,6 +202,27 @@ def parse_alertmanager_payload(payload: dict[str, Any]) -> list[Alert]:
             raw=item,
         ))
     return out
+
+
+@app.post("/webhook/pagerduty")
+async def pagerduty_webhook(
+    request: Request,
+    bg: BackgroundTasks,
+    x_pagerduty_signature: str | None = Header(default=None),
+) -> dict[str, Any]:
+    raw = await request.body()
+    _verify_pagerduty_signature(raw, x_pagerduty_signature)
+    try:
+        payload = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {e}") from e
+
+    alert = parse_pagerduty_v3_payload(payload)
+    if alert is None:
+        return {"status": "ignored", "reason": "event_type not actionable"}
+    log.info("alert received src=pagerduty incident=%s service=%s", alert.id, alert.service)
+    bg.add_task(_run_pipeline, alert)
+    return {"status": "accepted", "incident_id": alert.id}
 
 
 @app.post("/webhook/datadog")
