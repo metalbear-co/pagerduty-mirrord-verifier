@@ -61,6 +61,9 @@ class PagerDutyIncidentNotePoster:
             json={"note": {"content": bundle.as_markdown()}},
             timeout=15,
         )
+        if r.status_code >= 400:
+            log.error("PagerDuty note POST failed (%d) for incident %s: %s",
+                      r.status_code, incident_id, r.text[:1000])
         r.raise_for_status()
         log.info("posted verification to PagerDuty incident %s", incident_id)
 

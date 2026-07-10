@@ -118,6 +118,11 @@ def parse_pagerduty_v3_payload(payload: dict[str, Any]) -> Alert | None:
     except ValueError:
         fired_at = datetime.utcnow()
 
+    # PagerDuty webhook payloads don't carry the service's code location. For
+    # the demo, resolve it from VERIFIER_SAMPLE_REPO. In production this would
+    # come from a service→repo catalog lookup keyed on the PD service id.
+    sample_repo = os.environ.get("VERIFIER_SAMPLE_REPO")
+
     return Alert(
         id=incident_id,
         title=data.get("title") or f"PagerDuty incident {incident_id}",
@@ -126,6 +131,7 @@ def parse_pagerduty_v3_payload(payload: dict[str, Any]) -> Alert | None:
         service=service,
         fired_at=fired_at,
         source="pagerduty",
+        repo_path=Path(sample_repo) if sample_repo else None,
         raw=payload,
     )
 
@@ -276,10 +282,37 @@ async def debug() -> dict[str, Any]:
     }
 
 
+def _load_prepared_patch(path: str):
+    """Load a prepared Patch from a scenario JSON file. Used by the demo to make
+    the PASS run deterministic (skips the stochastic Claude call).
+    """
+    import json as _json
+
+    from .models import Patch, PatchFile
+
+    with open(path) as f:
+        blob = _json.load(f)
+    pp = blob["prepared_patch"]
+    return Patch(
+        summary=pp["summary"],
+        hypothesis=pp["hypothesis"],
+        repro_steps=pp.get("repro_steps", []),
+        files=[PatchFile(**f) for f in pp["files"]],
+        confidence=pp.get("confidence", 0.9),
+        expected_signal_change=pp.get("expected_signal_change", ""),
+        model=pp.get("model", "hand-crafted"),
+    )
+
+
 async def _run_pipeline(alert: Alert) -> None:
     """Two-stage flow: exec-verify (always) → preview env (only on PASS)."""
     try:
-        patch = await asyncio.to_thread(_get_orchestrator().propose_patch, alert)
+        prepared = os.environ.get("PREPARED_PATCH_FILE")
+        if prepared:
+            log.info("using prepared patch: %s", prepared)
+            patch = _load_prepared_patch(prepared)
+        else:
+            patch = await asyncio.to_thread(_get_orchestrator().propose_patch, alert)
         bundle = await asyncio.to_thread(_get_engine().verify, alert, patch)
 
         if bundle.result == VerificationResult.PASS:
