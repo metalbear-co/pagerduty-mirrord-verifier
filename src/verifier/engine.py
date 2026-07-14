@@ -68,11 +68,12 @@ _LEGACY_P99_IMPROVEMENT_THRESHOLD = 0.30
 _LEGACY_ERROR_IMPROVEMENT_THRESHOLD = 0.50
 _LEGACY_REGRESSION_TOLERANCE = 0.05
 
-# Load shape — concurrency keeps the run bounded even when the candidate
-# hangs on some fraction of requests. 100 requests / 10 concurrent = ~10 batches,
-# worst-case 10 * _REQUEST_TIMEOUT_S = 50s per run.
+# Load shape — small concurrency keeps mirrord's per-candidate outbound
+# routing from queueing (which would inflate patched p99 with wait time,
+# not real work). Trade-off: worst-case run time is 100/3 * 5s ≈ 170s
+# when every request hits the timeout.
 _LOAD_REQUESTS = 100
-_LOAD_CONCURRENCY = 10
+_LOAD_CONCURRENCY = 3
 _REQUEST_TIMEOUT_S = 5.0
 _READY_TIMEOUT_S = 30
 _SHUTDOWN_TIMEOUT_S = 15
