@@ -30,6 +30,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -195,6 +196,8 @@ class VerificationEngine:
     def _drive_load(self, url: str, label: str) -> RunMetrics:
         latencies_ms: list[float] = [0.0] * _LOAD_REQUESTS
         error_flags: list[int] = [0] * _LOAD_REQUESTS
+        completed = [0]  # mutable counter shared across threads
+        completed_lock = threading.Lock()
 
         def _one(i: int) -> None:
             t0 = time.perf_counter()
@@ -206,6 +209,13 @@ class VerificationEngine:
             except httpx.HTTPError:
                 error_flags[i] = 1
             latencies_ms[i] = (time.perf_counter() - t0) * 1000.0
+            with completed_lock:
+                completed[0] += 1
+                # Emit progress every 10 completions so the run's visible in logs.
+                if completed[0] % 10 == 0 or completed[0] == _LOAD_REQUESTS:
+                    err_so_far = sum(error_flags[:i+1])
+                    log.info("[%s] progress: %d/%d completed, %d errors so far",
+                             label, completed[0], _LOAD_REQUESTS, err_so_far)
 
         with ThreadPoolExecutor(max_workers=_LOAD_CONCURRENCY) as pool:
             list(pool.map(_one, range(_LOAD_REQUESTS)))
