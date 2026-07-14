@@ -23,7 +23,7 @@ logging.basicConfig(
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 from .engine import VerificationEngine
-from .models import Alert, PreviewArtifact, Severity, VerificationResult
+from .models import Alert, PreviewArtifact, Severity, Slo, SloOperator, SloSignal, VerificationResult
 from .poster import PagerDutyIncidentNotePoster, Poster, StdoutPoster
 
 log = logging.getLogger("verifier.webhook")
@@ -84,6 +84,26 @@ def _verify_pagerduty_signature(raw_body: bytes, header: str | None) -> None:
         raise HTTPException(status_code=401, detail="signature mismatch")
 
 
+def _derive_slo_from_title(title: str) -> Slo | None:
+    """Best-effort SLO extraction from a PagerDuty incident title.
+
+    Demo-quality: matches the incident-title conventions we use in the demo
+    ('checkout p99 above SLO' → p99>300ms). In production the SLO would be
+    resolved from the alert-rule metadata linked to the incident, not the
+    human-readable title.
+    """
+    t = title.lower()
+    if "slo" not in t:
+        return None
+    if "p99" in t:
+        return Slo(signal=SloSignal.P99_MS, operator=SloOperator.GT, threshold=300.0)
+    if "p50" in t:
+        return Slo(signal=SloSignal.P50_MS, operator=SloOperator.GT, threshold=200.0)
+    if "error rate" in t or "error_rate" in t:
+        return Slo(signal=SloSignal.ERROR_RATE, operator=SloOperator.GT, threshold=0.05)
+    return None
+
+
 def parse_pagerduty_v3_payload(payload: dict[str, Any]) -> Alert | None:
     """Map a PagerDuty V3 webhook body into our Alert shape.
 
@@ -123,15 +143,17 @@ def parse_pagerduty_v3_payload(payload: dict[str, Any]) -> Alert | None:
     # come from a service→repo catalog lookup keyed on the PD service id.
     sample_repo = os.environ.get("VERIFIER_SAMPLE_REPO")
 
+    title = data.get("title") or f"PagerDuty incident {incident_id}"
     return Alert(
         id=incident_id,
-        title=data.get("title") or f"PagerDuty incident {incident_id}",
-        body=data.get("description") or data.get("title", ""),
+        title=title,
+        body=data.get("description") or title,
         severity=Severity.ERROR,
         service=service,
         fired_at=fired_at,
         source="pagerduty",
         repo_path=Path(sample_repo) if sample_repo else None,
+        slo=_derive_slo_from_title(title),
         raw=payload,
     )
 
