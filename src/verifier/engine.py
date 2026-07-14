@@ -199,13 +199,14 @@ class VerificationEngine:
         completed = [0]  # mutable counter shared across threads
         completed_lock = threading.Lock()
 
+        client = httpx.Client(timeout=_REQUEST_TIMEOUT_S)
+
         def _one(i: int) -> None:
             t0 = time.perf_counter()
             try:
-                with httpx.Client(timeout=_REQUEST_TIMEOUT_S) as client:
-                    r = client.post(url, json={"item_id": f"item-{i % 10}", "qty": 1})
-                    if r.status_code >= 500:
-                        error_flags[i] = 1
+                r = client.post(url, json={"item_id": f"item-{i % 10}", "qty": 1})
+                if r.status_code >= 500:
+                    error_flags[i] = 1
             except httpx.HTTPError:
                 error_flags[i] = 1
             latencies_ms[i] = (time.perf_counter() - t0) * 1000.0
@@ -217,8 +218,11 @@ class VerificationEngine:
                     log.info("[%s] progress: %d/%d completed, %d errors so far",
                              label, completed[0], _LOAD_REQUESTS, err_so_far)
 
-        with ThreadPoolExecutor(max_workers=_LOAD_CONCURRENCY) as pool:
-            list(pool.map(_one, range(_LOAD_REQUESTS)))
+        try:
+            with ThreadPoolExecutor(max_workers=_LOAD_CONCURRENCY) as pool:
+                list(pool.map(_one, range(_LOAD_REQUESTS)))
+        finally:
+            client.close()
 
         errors = sum(error_flags)
 

@@ -67,4 +67,7 @@ def metrics():
 
 def run() -> None:
     port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    # threaded=True so the verifier's concurrent load driver doesn't queue
+    # requests on this single-threaded Flask dev server (would inflate p99
+    # artificially with queueing delay rather than real work).
+    app.run(host="0.0.0.0", port=port, threaded=True)
