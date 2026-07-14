@@ -96,9 +96,9 @@ def _derive_slo_from_title(title: str) -> Slo | None:
     if "slo" not in t:
         return None
     if "p99" in t:
-        return Slo(signal=SloSignal.P99_MS, operator=SloOperator.GT, threshold=300.0)
+        return Slo(signal=SloSignal.P99_MS, operator=SloOperator.GT, threshold=500.0)
     if "p50" in t:
-        return Slo(signal=SloSignal.P50_MS, operator=SloOperator.GT, threshold=200.0)
+        return Slo(signal=SloSignal.P50_MS, operator=SloOperator.GT, threshold=300.0)
     if "error rate" in t or "error_rate" in t:
         return Slo(signal=SloSignal.ERROR_RATE, operator=SloOperator.GT, threshold=0.05)
     return None
