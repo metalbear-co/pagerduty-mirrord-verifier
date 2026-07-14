@@ -68,12 +68,14 @@ _LEGACY_P99_IMPROVEMENT_THRESHOLD = 0.30
 _LEGACY_ERROR_IMPROVEMENT_THRESHOLD = 0.50
 _LEGACY_REGRESSION_TOLERANCE = 0.05
 
-# Load shape — small concurrency keeps mirrord's per-candidate outbound
-# routing from queueing (which would inflate patched p99 with wait time,
-# not real work). Trade-off: worst-case run time is 100/3 * 5s ≈ 170s
-# when every request hits the timeout.
+# Load shape — sequential. Mirrord's per-candidate outbound routing
+# serializes concurrent calls, so any load-driver concurrency queues on the
+# candidate side and inflates patched p99 with wait time. Sequential is
+# clean: each request measures actual per-request cost. Trade-off:
+# worst-case run time is 100 * 5s = 500s when every request hits the
+# timeout (rare — real REJECTs usually fail fast).
 _LOAD_REQUESTS = 100
-_LOAD_CONCURRENCY = 3
+_LOAD_CONCURRENCY = 1
 _REQUEST_TIMEOUT_S = 5.0
 _READY_TIMEOUT_S = 30
 _SHUTDOWN_TIMEOUT_S = 15
