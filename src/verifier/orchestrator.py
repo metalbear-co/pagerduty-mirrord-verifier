@@ -10,7 +10,7 @@ from pathlib import Path
 
 from anthropic import Anthropic
 
-from .models import Alert, Patch, PatchFile
+from .models import Alert, Patch, PatchFile, RunMetrics
 
 log = logging.getLogger("verifier.orchestrator")
 
@@ -49,6 +49,55 @@ class AISREOrchestrator:
             )
         self.client = Anthropic(api_key=api_key)
         self.model = model or os.environ.get("VERIFIER_MODEL", DEFAULT_MODEL)
+
+    def explain_rejection(
+        self,
+        patch: Patch,
+        baseline: RunMetrics,
+        patched: RunMetrics,
+        patched_stderr: str,
+    ) -> str:
+        """Ask Claude why its patch failed, given the observed failure signals.
+
+        Called only on REJECT verdicts. Adds a human-readable 'why' line to the
+        proof bundle so on-call sees more than 'the numbers didn't move'.
+        """
+        prompt = f"""Your earlier patch was REJECTED by the verifier. Explain in ONE
+short paragraph (2-3 sentences max) WHY it failed. Point at the specific line or
+behavior in your patch that caused the failure, using the stderr tail as evidence.
+Do not repeat the numbers, just explain the mechanism.
+
+# Your patch
+Summary: {patch.summary}
+Hypothesis: {patch.hypothesis}
+
+Files changed:
+""" + "\n".join(
+            f"--- {f.path} ---\nBEFORE:\n{f.before}\n\nAFTER:\n{f.after}\n"
+            for f in patch.files
+        ) + f"""
+
+# Observed result
+Baseline: p50={baseline.duration_ms_p50:.0f}ms p99={baseline.duration_ms_p99:.0f}ms error_rate={baseline.error_rate*100:.1f}%
+Patched:  p50={patched.duration_ms_p50:.0f}ms p99={patched.duration_ms_p99:.0f}ms error_rate={patched.error_rate*100:.1f}%
+
+# Patched-run stderr tail (last 3KB)
+{patched_stderr[-3000:] if patched_stderr else "(empty)"}
+
+Return only the paragraph, no preamble."""
+
+        try:
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=400,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
+            log.info("explanation generated (%d chars)", len(text))
+            return text
+        except Exception as e:
+            log.warning("explain_rejection failed: %s", e)
+            return ""
 
     def propose_patch(self, alert: Alert) -> Patch:
         repo_snapshot = _snapshot_repo(alert.repo_path) if alert.repo_path else ""

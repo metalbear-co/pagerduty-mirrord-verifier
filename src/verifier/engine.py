@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -66,8 +67,11 @@ _LEGACY_P99_IMPROVEMENT_THRESHOLD = 0.30
 _LEGACY_ERROR_IMPROVEMENT_THRESHOLD = 0.50
 _LEGACY_REGRESSION_TOLERANCE = 0.05
 
-# Load shape — keep small enough to finish each run in ~30s.
+# Load shape — concurrency keeps the run bounded even when the candidate
+# hangs on some fraction of requests. 100 requests / 10 concurrent = ~10 batches,
+# worst-case 10 * _REQUEST_TIMEOUT_S = 50s per run.
 _LOAD_REQUESTS = 100
+_LOAD_CONCURRENCY = 10
 _REQUEST_TIMEOUT_S = 5.0
 _READY_TIMEOUT_S = 30
 _SHUTDOWN_TIMEOUT_S = 15
@@ -93,10 +97,24 @@ class VerificationEngine:
             shutil.copytree(alert.repo_path, patched_dir)
             self._apply_patch(patched_dir, patch)
 
-            baseline = self._run_candidate(baseline_dir, label="baseline")
-            patched = self._run_candidate(patched_dir, label="patched")
+            baseline, _ = self._run_candidate(baseline_dir, label="baseline")
+            patched, patched_stderr = self._run_candidate(patched_dir, label="patched")
 
         result, rationale = self._classify(baseline, patched, alert, patch)
+
+        # On REJECT, ask Claude to explain why its patch failed. Wrapped so a
+        # failure here never blocks the verdict from being posted.
+        explanation: str | None = None
+        if result == VerificationResult.REJECT:
+            try:
+                from .orchestrator import AISREOrchestrator
+
+                explanation = AISREOrchestrator().explain_rejection(
+                    patch, baseline, patched, patched_stderr
+                )
+            except Exception:
+                log.exception("explain_rejection failed; posting verdict without explanation")
+
         return ProofBundle(
             alert=alert,
             patch=patch,
@@ -104,12 +122,13 @@ class VerificationEngine:
             patched=patched,
             result=result,
             rationale=rationale,
+            explanation=explanation,
             generated_at=datetime.utcnow(),
         )
 
     # ---- per-run lifecycle ----------------------------------------------------
 
-    def _run_candidate(self, candidate_dir: Path, label: str) -> RunMetrics:
+    def _run_candidate(self, candidate_dir: Path, label: str) -> tuple[RunMetrics, str]:
         port = _pick_free_port()
         url_root = f"http://127.0.0.1:{port}"
         cmd = [sys.executable, "-m", "app"]
@@ -121,6 +140,7 @@ class VerificationEngine:
 
         log.info("[%s] starting candidate server on %s", label, url_root)
         proc = self.runner.start_server(cmd, cwd=candidate_dir, label=label, extra_env=env)
+        stderr_tail = ""
         try:
             self._wait_ready(f"{url_root}/healthz", proc, label)
             metrics = self._drive_load(f"{url_root}/checkout", label)
@@ -140,7 +160,7 @@ class VerificationEngine:
                     log.info("[%s] candidate stderr tail:\n%s", label, stderr_tail)
             except Exception:
                 pass
-        return metrics
+        return metrics, stderr_tail
 
     def _wait_ready(
         self, healthz_url: str, proc: subprocess.Popen[str], label: str
@@ -173,18 +193,24 @@ class VerificationEngine:
         raise RuntimeError(f"[{label}] candidate did not become ready in {_READY_TIMEOUT_S}s")
 
     def _drive_load(self, url: str, label: str) -> RunMetrics:
-        latencies_ms: list[float] = []
-        errors = 0
-        with httpx.Client(timeout=_REQUEST_TIMEOUT_S) as client:
-            for i in range(_LOAD_REQUESTS):
-                t0 = time.perf_counter()
-                try:
+        latencies_ms: list[float] = [0.0] * _LOAD_REQUESTS
+        error_flags: list[int] = [0] * _LOAD_REQUESTS
+
+        def _one(i: int) -> None:
+            t0 = time.perf_counter()
+            try:
+                with httpx.Client(timeout=_REQUEST_TIMEOUT_S) as client:
                     r = client.post(url, json={"item_id": f"item-{i % 10}", "qty": 1})
                     if r.status_code >= 500:
-                        errors += 1
-                except httpx.HTTPError:
-                    errors += 1
-                latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+                        error_flags[i] = 1
+            except httpx.HTTPError:
+                error_flags[i] = 1
+            latencies_ms[i] = (time.perf_counter() - t0) * 1000.0
+
+        with ThreadPoolExecutor(max_workers=_LOAD_CONCURRENCY) as pool:
+            list(pool.map(_one, range(_LOAD_REQUESTS)))
+
+        errors = sum(error_flags)
 
         latencies_ms.sort()
         metrics = RunMetrics(

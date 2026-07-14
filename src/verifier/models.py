@@ -129,6 +129,9 @@ class ProofBundle(BaseModel):
     patched: RunMetrics
     result: VerificationResult
     rationale: str
+    # Populated only on REJECT: a short human-readable explanation from the
+    # AI-SRE of why the patch failed, given the failure metrics and stderr.
+    explanation: str | None = None
     preview: PreviewArtifact | None = None  # populated only on stage-1 PASS
     generated_at: datetime = Field(default_factory=datetime.utcnow)
 
