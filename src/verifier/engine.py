@@ -30,9 +30,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -71,11 +69,10 @@ _LEGACY_REGRESSION_TOLERANCE = 0.05
 # Load shape — sequential. Mirrord's per-candidate outbound routing
 # serializes concurrent calls, so any load-driver concurrency queues on the
 # candidate side and inflates patched p99 with wait time. Sequential is
-# clean: each request measures actual per-request cost. Trade-off:
-# worst-case run time is 100 * 5s = 500s when every request hits the
-# timeout (rare — real REJECTs usually fail fast).
+# clean: each request measures actual per-request cost. A circuit breaker
+# in _drive_load aborts the run early if the candidate dies (10 consecutive
+# errors + failing healthz) so we don't burn 5s per request against a corpse.
 _LOAD_REQUESTS = 100
-_LOAD_CONCURRENCY = 1
 _REQUEST_TIMEOUT_S = 5.0
 _READY_TIMEOUT_S = 30
 _SHUTDOWN_TIMEOUT_S = 15
@@ -197,37 +194,56 @@ class VerificationEngine:
         raise RuntimeError(f"[{label}] candidate did not become ready in {_READY_TIMEOUT_S}s")
 
     def _drive_load(self, url: str, label: str) -> RunMetrics:
-        latencies_ms: list[float] = [0.0] * _LOAD_REQUESTS
-        error_flags: list[int] = [0] * _LOAD_REQUESTS
-        completed = [0]  # mutable counter shared across threads
-        completed_lock = threading.Lock()
+        latencies_ms: list[float] = []
+        errors = 0
+        consecutive_errors = 0
+        aborted_early = False
+        healthz_url = url.replace("/checkout", "/healthz")
 
-        client = httpx.Client(timeout=_REQUEST_TIMEOUT_S)
+        with httpx.Client(timeout=_REQUEST_TIMEOUT_S) as client:
+            for i in range(_LOAD_REQUESTS):
+                t0 = time.perf_counter()
+                is_error = False
+                try:
+                    r = client.post(url, json={"item_id": f"item-{i % 10}", "qty": 1})
+                    if r.status_code >= 500:
+                        is_error = True
+                except httpx.HTTPError:
+                    is_error = True
+                latencies_ms.append((time.perf_counter() - t0) * 1000.0)
 
-        def _one(i: int) -> None:
-            t0 = time.perf_counter()
-            try:
-                r = client.post(url, json={"item_id": f"item-{i % 10}", "qty": 1})
-                if r.status_code >= 500:
-                    error_flags[i] = 1
-            except httpx.HTTPError:
-                error_flags[i] = 1
-            latencies_ms[i] = (time.perf_counter() - t0) * 1000.0
-            with completed_lock:
-                completed[0] += 1
-                # Emit progress every 10 completions so the run's visible in logs.
-                if completed[0] % 10 == 0 or completed[0] == _LOAD_REQUESTS:
-                    err_so_far = sum(error_flags[:i+1])
+                if is_error:
+                    errors += 1
+                    consecutive_errors += 1
+                else:
+                    consecutive_errors = 0
+
+                # Progress every 5 completions so runs feel alive.
+                if (i + 1) % 5 == 0 or (i + 1) == _LOAD_REQUESTS:
                     log.info("[%s] progress: %d/%d completed, %d errors so far",
-                             label, completed[0], _LOAD_REQUESTS, err_so_far)
+                             label, i + 1, _LOAD_REQUESTS, errors)
 
-        try:
-            with ThreadPoolExecutor(max_workers=_LOAD_CONCURRENCY) as pool:
-                list(pool.map(_one, range(_LOAD_REQUESTS)))
-        finally:
-            client.close()
-
-        errors = sum(error_flags)
+                # Circuit breaker: after 10 consecutive errors, check /healthz.
+                # If the candidate is dead, no point spending 5s per request
+                # against a corpse. Bail with the metrics we already have.
+                if consecutive_errors >= 10:
+                    try:
+                        h = client.get(healthz_url, timeout=1.0)
+                        if h.status_code == 200:
+                            consecutive_errors = 0  # candidate alive, keep going
+                            continue
+                    except httpx.HTTPError:
+                        pass
+                    log.warning("[%s] candidate unhealthy after %d consecutive errors — "
+                                "aborting after %d/%d requests",
+                                label, consecutive_errors, i + 1, _LOAD_REQUESTS)
+                    aborted_early = True
+                    # Treat the unrun requests as errors so the metrics still reflect
+                    # the run's dominant behavior (broken).
+                    remaining = _LOAD_REQUESTS - (i + 1)
+                    errors += remaining
+                    latencies_ms.extend([_REQUEST_TIMEOUT_S * 1000.0] * remaining)
+                    break
 
         latencies_ms.sort()
         metrics = RunMetrics(
