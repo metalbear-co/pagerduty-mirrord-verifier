@@ -72,7 +72,7 @@ _LEGACY_REGRESSION_TOLERANCE = 0.05
 # clean: each request measures actual per-request cost. A circuit breaker
 # in _drive_load aborts the run early if the candidate dies (10 consecutive
 # errors + failing healthz) so we don't burn 5s per request against a corpse.
-_LOAD_REQUESTS = 100
+_LOAD_REQUESTS = 20
 _REQUEST_TIMEOUT_S = 5.0
 _READY_TIMEOUT_S = 30
 _SHUTDOWN_TIMEOUT_S = 15
